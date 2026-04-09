@@ -5,3 +5,4 @@ __pycache__/
 *.pyc
 .hypothesis
 .DS_Store
+hive-swarm/
