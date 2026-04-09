@@ -1,0 +1,7 @@
+trace.json
+run.log
+results.tsv
+__pycache__/
+*.pyc
+.hypothesis
+.DS_Store

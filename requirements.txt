@@ -1,0 +1,2 @@
+# No external dependencies required.
+# The simulator and kernel use only Python standard library.
