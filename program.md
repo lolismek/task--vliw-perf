@@ -12,7 +12,8 @@ Optimize a tree-traversal kernel running on a custom VLIW SIMD processor simulat
    - `tests/submission_tests.py` — Frozen test harness. **Do not modify.**
    - `tests/frozen_problem.py` — Frozen simulator copy used by tests. **Do not modify.**
    - `eval/eval.sh` — Evaluation script. **Do not modify.**
-   - `references/` — Architecture reference and optimization guide. Read these.
+   - `references/` — Architecture reference, optimization guide, and a reference solution. Read these.
+   - `references/reference_solution_1525.py` — A working 1,525-cycle solution. **Copy this over `perf_takehome.py` as your starting point** rather than optimizing from the 147K baseline. Study its techniques: SIMD vectorization, multiply_add fusion, depth 0-2 tree preloading, and list scheduling.
 
 2. **Run prepare:** `bash prepare.sh`
 
