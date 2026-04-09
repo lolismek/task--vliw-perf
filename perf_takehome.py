@@ -100,20 +100,84 @@ class KernelBuilder:
         flow_vec = 0
         store_vec = 0
 
-        def can_issue(v, group_id):
+        def addrs(base, length):
+            return set(range(base, base + length))
+
+        def slot_rw(engine, slot):
+            if engine == "alu":
+                _op, dest, a1, a2 = slot
+                return ({a1, a2}, {dest})
+            if engine == "valu":
+                if slot[0] == "vbroadcast":
+                    _op, dest, src = slot
+                    return ({src}, addrs(dest, VLEN))
+                if slot[0] == "multiply_add":
+                    _op, dest, a, b, c = slot
+                    return (addrs(a, VLEN) | addrs(b, VLEN) | addrs(c, VLEN), addrs(dest, VLEN))
+                _op, dest, a1, a2 = slot
+                return (addrs(a1, VLEN) | addrs(a2, VLEN), addrs(dest, VLEN))
+            if engine == "load":
+                if slot[0] == "load":
+                    _op, dest, addr = slot
+                    return ({addr}, {dest})
+                if slot[0] == "load_offset":
+                    _op, dest, addr, offset = slot
+                    return ({addr + offset}, {dest + offset})
+                if slot[0] == "vload":
+                    _op, dest, addr = slot
+                    return ({addr}, addrs(dest, VLEN))
+                if slot[0] == "const":
+                    _op, dest, _val = slot
+                    return (set(), {dest})
+            if engine == "store":
+                if slot[0] == "store":
+                    _op, addr, src = slot
+                    return ({addr, src}, set())
+                if slot[0] == "vstore":
+                    _op, addr, src = slot
+                    return ({addr} | addrs(src, VLEN), set())
+            if engine == "flow":
+                if slot[0] == "select":
+                    _op, dest, cond, a, b = slot
+                    return ({cond, a, b}, {dest})
+                if slot[0] == "add_imm":
+                    _op, dest, a, _imm = slot
+                    return ({a}, {dest})
+                if slot[0] == "vselect":
+                    _op, dest, cond, a, b = slot
+                    return (addrs(cond, VLEN) | addrs(a, VLEN) | addrs(b, VLEN), addrs(dest, VLEN))
+            return (set(), set())
+
+        def can_issue(v, engine, slot, group_id, cycle_writes, cycle_has_store):
             if last_cycle[v] < cycle:
                 return True
-            return last_group[v] == group_id
+            if last_group[v] == group_id:
+                return True
+            # Fully dependency-based: allow ANY group ahead as long as no
+            # intra-cycle data hazard for this vector.
+            if last_group[v] is not None and group_id > last_group[v]:
+                reads, writes = slot_rw(engine, slot)
+                blocked = cycle_writes[v]
+                if reads & blocked:
+                    return False
+                if writes & blocked:
+                    return False
+                return True
+            return False
+
+        n_vecs = len(vec_ops)
 
         while remaining > 0:
             bundle = defaultdict(list)
+            cycle_writes = [set() for _ in range(n_vecs)]
+            cycle_has_store = [False]
 
             candidates = []
             for v, ops in enumerate(vec_ops):
                 if idxs[v] >= len(ops):
                     continue
                 op = ops[idxs[v]]
-                if not can_issue(v, op[2]):
+                if not can_issue(v, op[0], op[1], op[2], cycle_writes, cycle_has_store):
                     continue
                 engine = op[0]
                 if engine != "valu":
@@ -125,11 +189,15 @@ class KernelBuilder:
                     if next_op[0] != "valu" or next_op[2] != group_id:
                         break
                     count += 1
+                # Prioritize: vectors closest to needing loads (urgent first),
+                # then vectors with MOST remaining ops (drain optimization),
+                # then idle vectors, then round-robin tiebreak
+                ops_remaining = len(ops) - idxs[v]
                 dist_load = load_dist[v][idxs[v]]
-                dist_flow = flow_dist[v][idxs[v]]
                 idle = cycle - last_cycle[v]
-                candidates.append((dist_load, dist_flow, -idle, count, v))
-            for _dist_load, _dist_flow, _idle, _count, v in sorted(candidates):
+                rr = (v + cycle) % n_vecs  # Round-robin to avoid v=0 bias
+                candidates.append((dist_load, -ops_remaining, -idle, count, rr, v))
+            for _dist_load, _ops_rem, _idle, _count, _rr, v in sorted(candidates):
                 ops = vec_ops[v]
                 group_id = ops[idxs[v]][2]
                 while len(bundle["valu"]) < SLOT_LIMITS["valu"]:
@@ -139,6 +207,8 @@ class KernelBuilder:
                     if op[0] != "valu" or op[2] != group_id:
                         break
                     bundle["valu"].append(op[1])
+                    _reads, writes = slot_rw("valu", op[1])
+                    cycle_writes[v] |= writes
                     idxs[v] += 1
                     last_cycle[v] = cycle
                     last_engine[v] = "valu"
@@ -147,12 +217,41 @@ class KernelBuilder:
                 if len(bundle["valu"]) >= SLOT_LIMITS["valu"]:
                     break
 
+            # Cross-group VALU filling: if slots remain, try other vectors'
+            # VALU ops even from different groups (no data dependency check)
+            if 0 < len(bundle["valu"]) < SLOT_LIMITS["valu"]:
+                for v, ops in enumerate(vec_ops):
+                    if len(bundle["valu"]) >= SLOT_LIMITS["valu"]:
+                        break
+                    if idxs[v] >= len(ops):
+                        continue
+                    op = ops[idxs[v]]
+                    if op[0] != "valu":
+                        continue
+                    if not can_issue(v, op[0], op[1], op[2], cycle_writes, cycle_has_store):
+                        continue
+                    group_id = op[2]
+                    while len(bundle["valu"]) < SLOT_LIMITS["valu"]:
+                        if idxs[v] >= len(ops):
+                            break
+                        op = ops[idxs[v]]
+                        if op[0] != "valu" or op[2] != group_id:
+                            break
+                        bundle["valu"].append(op[1])
+                        _reads, writes = slot_rw("valu", op[1])
+                        cycle_writes[v] |= writes
+                        idxs[v] += 1
+                        last_cycle[v] = cycle
+                        last_engine[v] = "valu"
+                        last_group[v] = group_id
+                        remaining -= 1
+
             candidates = []
             for v, ops in enumerate(vec_ops):
                 if idxs[v] >= len(ops):
                     continue
                 op = ops[idxs[v]]
-                if not can_issue(v, op[2]):
+                if not can_issue(v, op[0], op[1], op[2], cycle_writes, cycle_has_store):
                     continue
                 if op[0] != "alu":
                     continue
@@ -175,6 +274,8 @@ class KernelBuilder:
                     if op[0] != "alu" or op[2] != group_id:
                         break
                     bundle["alu"].append(op[1])
+                    _reads, writes = slot_rw("alu", op[1])
+                    cycle_writes[v] |= writes
                     idxs[v] += 1
                     last_cycle[v] = cycle
                     last_engine[v] = "alu"
@@ -188,7 +289,7 @@ class KernelBuilder:
                 if idxs[v] >= len(ops):
                     continue
                 op = ops[idxs[v]]
-                if not can_issue(v, op[2]):
+                if not can_issue(v, op[0], op[1], op[2], cycle_writes, cycle_has_store):
                     continue
                 if op[0] != "load":
                     continue
@@ -202,7 +303,7 @@ class KernelBuilder:
                 if idxs[v] >= len(vec_ops[v]):
                     continue
                 op = vec_ops[v][idxs[v]]
-                if not can_issue(v, op[2]):
+                if not can_issue(v, op[0], op[1], op[2], cycle_writes, cycle_has_store):
                     continue
                 if op[0] != "load":
                     continue
@@ -220,6 +321,8 @@ class KernelBuilder:
                     if engine != "load" or op[2] != group_id:
                         break
                     bundle["load"].append(slot)
+                    _reads, writes = slot_rw("load", slot)
+                    cycle_writes[load_vec] |= writes
                     idxs[load_vec] += 1
                     last_cycle[load_vec] = cycle
                     last_engine[load_vec] = "load"
@@ -233,12 +336,14 @@ class KernelBuilder:
                     if idxs[v] >= len(ops):
                         continue
                     op = ops[idxs[v]]
-                    if not can_issue(v, op[2]):
+                    if not can_issue(v, op[0], op[1], op[2], cycle_writes, cycle_has_store):
                         continue
                     engine, slot = op[0], op[1]
                     if engine != "load":
                         continue
                     bundle["load"].append(slot)
+                    _reads, writes = slot_rw("load", slot)
+                    cycle_writes[v] |= writes
                     idxs[v] += 1
                     last_cycle[v] = cycle
                     last_engine[v] = "load"
@@ -251,7 +356,7 @@ class KernelBuilder:
                 if idxs[v] >= len(ops):
                     continue
                 op = ops[idxs[v]]
-                if not can_issue(v, op[2]):
+                if not can_issue(v, op[0], op[1], op[2], cycle_writes, cycle_has_store):
                     continue
                 if op[0] != "store":
                     continue
@@ -265,7 +370,7 @@ class KernelBuilder:
                 if idxs[v] >= len(vec_ops[v]):
                     continue
                 op = vec_ops[v][idxs[v]]
-                if not can_issue(v, op[2]):
+                if not can_issue(v, op[0], op[1], op[2], cycle_writes, cycle_has_store):
                     continue
                 if op[0] != "store":
                     continue
@@ -283,6 +388,9 @@ class KernelBuilder:
                     if engine != "store" or op[2] != group_id:
                         break
                     bundle["store"].append(slot)
+                    _reads, writes = slot_rw("store", slot)
+                    cycle_writes[store_vec] |= writes
+                    cycle_has_store[0] = True
                     idxs[store_vec] += 1
                     last_cycle[store_vec] = cycle
                     last_engine[store_vec] = "store"
@@ -296,12 +404,15 @@ class KernelBuilder:
                     if idxs[v] >= len(ops):
                         continue
                     op = ops[idxs[v]]
-                    if not can_issue(v, op[2]):
+                    if not can_issue(v, op[0], op[1], op[2], cycle_writes, cycle_has_store):
                         continue
                     engine, slot = op[0], op[1]
                     if engine != "store":
                         continue
                     bundle["store"].append(slot)
+                    _reads, writes = slot_rw("store", slot)
+                    cycle_writes[v] |= writes
+                    cycle_has_store[0] = True
                     idxs[v] += 1
                     last_cycle[v] = cycle
                     last_engine[v] = "store"
@@ -315,12 +426,14 @@ class KernelBuilder:
                 if idxs[v] >= len(ops):
                     continue
                 op = ops[idxs[v]]
-                if not can_issue(v, op[2]):
+                if not can_issue(v, op[0], op[1], op[2], cycle_writes, cycle_has_store):
                     continue
                 if op[0] != "flow":
                     continue
+                # Prefer vectors with most pending VALU work (keeps pipeline fed)
+                pending_valu = sum(1 for j in range(idxs[v], len(ops)) if ops[j][0] == "valu")
                 dist_load = load_dist[v][idxs[v]]
-                key = (dist_load, v)
+                key = (dist_load, -pending_valu, v)
                 if best_flow is None or key < best_flow[0]:
                     best_flow = (key, v)
             if best_flow is not None:
@@ -330,6 +443,8 @@ class KernelBuilder:
                 ops = vec_ops[flow_vec]
                 op = ops[idxs[flow_vec]]
                 bundle["flow"].append(op[1])
+                _reads, writes = slot_rw("flow", op[1])
+                cycle_writes[flow_vec] |= writes
                 idxs[flow_vec] += 1
                 last_cycle[flow_vec] = cycle
                 last_engine[flow_vec] = "flow"
@@ -469,8 +584,12 @@ class KernelBuilder:
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
         """
-        Vectorized implementation using valu and vload/vstore.
-        Falls back to scalar when batch_size is not a multiple of VLEN.
+        Highly optimized vectorized implementation targeting ~1300 cycles.
+        Key optimizations:
+        - Efficient operation generation with minimal dependencies  
+        - Aggressive use of multiply_add fusion
+        - Optimized scheduling hints for better VALU packing
+        - Streamlined prefetching and memory access patterns
         """
         if batch_size % VLEN != 0:
             self.build_kernel_scalar(forest_height, n_nodes, batch_size, rounds)
@@ -511,32 +630,80 @@ class KernelBuilder:
                 seq["ops"].append((eng, sl, seq["group"]))
             seq["group"] += 1
 
+        const_cache = {}
+
         def add_const_vec(val, name):
+            if val in const_cache:
+                return const_cache[val]
             scalar = self.alloc_scratch(name)
             vaddr = self.alloc_vec(f"v_{name}" if name else None)
-            seq = new_seq()
-            seq_add(seq, "load", ("const", scalar, val))
-            seq_add(seq, "valu", ("vbroadcast", vaddr, scalar))
-            pre_vec_ops.append(seq["ops"])
-            return vaddr
+            const_cache[val] = (scalar, vaddr)
+            return scalar, vaddr
 
-        v_one = add_const_vec(1, "one")
-        v_two = add_const_vec(2, "two")
-
+        # Batch allocate all constants first
+        v_one_s, v_one = add_const_vec(1, "one")
+        v_two_s, v_two = add_const_vec(2, "two")
+        
+        hash_const1_s = []
         hash_const1 = []
+        hash_const3_s = []
         hash_const3 = []
+        hash_mul_s = []
         hash_mul = []
+        
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            hash_const1.append(add_const_vec(val1, f"h1_{hi}"))
-            hash_const3.append(add_const_vec(val3, f"h3_{hi}"))
+            s1, v1 = add_const_vec(val1, f"h1_{hi}")
+            hash_const1_s.append(s1)
+            hash_const1.append(v1)
+            s3, v3 = add_const_vec(val3, f"h3_{hi}")
+            hash_const3_s.append(s3)
+            hash_const3.append(v3)
             if op1 == "+" and op2 == "+" and op3 == "<<":
                 mul_val = (1 + (1 << val3)) % (2**32)
-                hash_mul.append(add_const_vec(mul_val, f"hm_{hi}"))
+                sm, vm = add_const_vec(mul_val, f"hm_{hi}")
+                hash_mul_s.append(sm)
+                hash_mul.append(vm)
             else:
+                hash_mul_s.append(None)
                 hash_mul.append(None)
+
+        # Now load all scalar constants in parallel batches
+        const_ops = new_seq()
+        all_consts = [(v_one_s, 1), (v_two_s, 2)]
+        for i in range(len(hash_const1_s)):
+            all_consts.append((hash_const1_s[i], HASH_STAGES[i][1]))
+            all_consts.append((hash_const3_s[i], HASH_STAGES[i][4]))
+            if hash_mul_s[i] is not None:
+                mul_val = (1 + (1 << HASH_STAGES[i][4])) % (2**32)
+                all_consts.append((hash_mul_s[i], mul_val))
+        
+        # Load constants in groups of 2 (2 load slots)
+        for i in range(0, len(all_consts), 2):
+            par_ops = [("load", ("const", all_consts[i][0], all_consts[i][1]))]
+            if i + 1 < len(all_consts):
+                par_ops.append(("load", ("const", all_consts[i+1][0], all_consts[i+1][1])))
+            seq_parallel(const_ops, par_ops)
+        
+        # Broadcast all constants in groups of 6 (6 VALU slots)
+        all_broadcasts = [(v_one_s, v_one), (v_two_s, v_two)]
+        for i in range(len(hash_const1)):
+            all_broadcasts.append((hash_const1_s[i], hash_const1[i]))
+            all_broadcasts.append((hash_const3_s[i], hash_const3[i]))
+            if hash_mul_s[i] is not None:
+                all_broadcasts.append((hash_mul_s[i], hash_mul[i]))
+        
+        for i in range(0, len(all_broadcasts), 6):
+            par_ops = []
+            for j in range(min(6, len(all_broadcasts) - i)):
+                par_ops.append(("valu", ("vbroadcast", all_broadcasts[i+j][1], all_broadcasts[i+j][0])))
+            seq_parallel(const_ops, par_ops)
+        
+        pre_vec_ops.append(const_ops["ops"])
 
         node_addr = self.alloc_scratch("node_addr")
         node_val = self.alloc_scratch("node_val")
+        node_addr2 = self.alloc_scratch("node_addr2")
+        node_val2 = self.alloc_scratch("node_val2")
 
         prefetch_depth = min(forest_height, 2)
         max_prefetch_idx = (1 << (prefetch_depth + 1)) - 2
@@ -544,31 +711,90 @@ class KernelBuilder:
         for idx in range(max_prefetch_idx + 1):
             node_vecs[idx] = self.alloc_vec(f"node_{idx}")
 
+        # Optimized: Process 2 nodes per cycle using both flow and load slots
         node_ops = new_seq()
-        for idx in range(max_prefetch_idx + 1):
+        for idx in range(0, max_prefetch_idx + 1, 2):
+            # Compute addresses (flow has 1 slot, so do them sequentially)
             seq_add(
                 node_ops,
                 "flow",
                 ("add_imm", node_addr, self.scratch["forest_values_p"], idx),
             )
-            seq_add(node_ops, "load", ("load", node_val, node_addr))
-            seq_add(node_ops, "valu", ("vbroadcast", node_vecs[idx], node_val))
+            if idx + 1 <= max_prefetch_idx:
+                seq_add(
+                    node_ops,
+                    "flow",
+                    ("add_imm", node_addr2, self.scratch["forest_values_p"], idx + 1),
+                )
+            # Load values (2 load slots - can do both in parallel!)
+            if idx + 1 <= max_prefetch_idx:
+                seq_parallel(
+                    node_ops,
+                    [
+                        ("load", ("load", node_val, node_addr)),
+                        ("load", ("load", node_val2, node_addr2)),
+                    ]
+                )
+            else:
+                seq_add(node_ops, "load", ("load", node_val, node_addr))
+            # Broadcast values (can do 2 in parallel using 2 of 6 VALU slots)
+            if idx + 1 <= max_prefetch_idx:
+                seq_parallel(
+                    node_ops,
+                    [
+                        ("valu", ("vbroadcast", node_vecs[idx], node_val)),
+                        ("valu", ("vbroadcast", node_vecs[idx + 1], node_val2)),
+                    ]
+                )
+            else:
+                seq_add(node_ops, "valu", ("vbroadcast", node_vecs[idx], node_val))
 
         pre_vec_ops.append(node_ops["ops"])
 
         depth_base_vecs = [None] * (forest_height + 1)
         base_addr = self.alloc_scratch("base_addr")
+        base_addr2 = self.alloc_scratch("base_addr2")
         depth_ops = new_seq()
-        for depth in range(3, forest_height + 1):
-            depth_base = (1 << depth) - 1
+        
+        # Process depth bases in pairs for better parallelism
+        depths_to_process = list(range(3, forest_height + 1))
+        for i in range(0, len(depths_to_process), 2):
+            depth1 = depths_to_process[i]
+            depth_base1 = (1 << depth1) - 1
+            vaddr1 = self.alloc_vec(f"depth_base_{depth1}")
+            depth_base_vecs[depth1] = vaddr1
+            
+            # Compute first address
             seq_add(
                 depth_ops,
                 "flow",
-                ("add_imm", base_addr, self.scratch["forest_values_p"], depth_base),
+                ("add_imm", base_addr, self.scratch["forest_values_p"], depth_base1),
             )
-            vaddr = self.alloc_vec(f"depth_base_{depth}")
-            depth_base_vecs[depth] = vaddr
-            seq_add(depth_ops, "valu", ("vbroadcast", vaddr, base_addr))
+            
+            # If there's a second depth, compute its address too
+            if i + 1 < len(depths_to_process):
+                depth2 = depths_to_process[i + 1]
+                depth_base2 = (1 << depth2) - 1
+                vaddr2 = self.alloc_vec(f"depth_base_{depth2}")
+                depth_base_vecs[depth2] = vaddr2
+                
+                seq_add(
+                    depth_ops,
+                    "flow",
+                    ("add_imm", base_addr2, self.scratch["forest_values_p"], depth_base2),
+                )
+                
+                # Broadcast both in parallel (2 of 6 VALU slots)
+                seq_parallel(
+                    depth_ops,
+                    [
+                        ("valu", ("vbroadcast", vaddr1, base_addr)),
+                        ("valu", ("vbroadcast", vaddr2, base_addr2)),
+                    ]
+                )
+            else:
+                # Only one depth left
+                seq_add(depth_ops, "valu", ("vbroadcast", vaddr1, base_addr))
 
         pre_vec_ops.append(depth_ops["ops"])
 
@@ -578,108 +804,70 @@ class KernelBuilder:
             idx_ptrs.append(self.alloc_scratch(f"idx_ptr_{v}"))
             val_ptrs.append(self.alloc_scratch(f"val_ptr_{v}"))
 
-        offset_base = self.alloc_scratch("vec_offsets", n_vecs)
-        val_p0 = self.alloc_scratch("val_p0")
-        val_p1 = self.alloc_scratch("val_p1")
-        stride = None
         ptr_ops = new_seq()
 
-        for v in range(0, n_vecs, 2):
-            par_ops = [("load", ("const", offset_base + v, v * VLEN))]
-            if v + 1 < n_vecs:
-                par_ops.append(
-                    ("load", ("const", offset_base + v + 1, (v + 1) * VLEN))
-                )
-            seq_parallel(ptr_ops, par_ops)
-
-        for v in range(0, n_vecs, 12):
-            par_ops = []
-            for u in range(v, min(v + 12, n_vecs)):
-                par_ops.append(
-                    (
-                        "alu",
-                        (
-                            "+",
-                            idx_ptrs[u],
-                            self.scratch["inp_indices_p"],
-                            offset_base + u,
-                        ),
-                    )
-                )
-            seq_parallel(ptr_ops, par_ops)
-
-        for v in range(0, n_vecs, 12):
-            par_ops = []
-            for u in range(v, min(v + 12, n_vecs)):
-                par_ops.append(
-                    (
-                        "alu",
-                        (
-                            "+",
-                            val_ptrs[u],
-                            self.scratch["inp_values_p"],
-                            offset_base + u,
-                        ),
-                    )
-                )
-            seq_parallel(ptr_ops, par_ops)
-
-        p1_offset = offset_base + 1 if n_vecs > 1 else offset_base
-        seq_parallel(
-            ptr_ops,
-            [
-                ("alu", ("+", val_p0, self.scratch["inp_values_p"], offset_base)),
-                ("alu", ("+", val_p1, self.scratch["inp_values_p"], p1_offset)),
-            ],
-        )
-
-        if n_vecs >= 3:
-            stride = offset_base + 2
-        else:
-            stride = self.alloc_scratch("stride")
-            seq_add(ptr_ops, "load", ("const", stride, 2 * VLEN))
-
-        for v in range(0, n_vecs, 2):
-            par_ops = [
-                (
-                    "valu",
-                    (
-                        "^",
-                        idx_base + v * VLEN,
-                        idx_base + v * VLEN,
-                        idx_base + v * VLEN,
-                    ),
-                ),
-            ]
-            if v + 1 < n_vecs:
-                par_ops.append(
-                    (
-                        "valu",
-                        (
-                            "^",
-                            idx_base + (v + 1) * VLEN,
-                            idx_base + (v + 1) * VLEN,
-                            idx_base + (v + 1) * VLEN,
-                        ),
-                    )
-                )
-            par_ops.append(("alu", ("+", val_p0, val_p0, stride)))
-            par_ops.append(("alu", ("+", val_p1, val_p1, stride)))
-            par_ops.append(("load", ("vload", val_base + v * VLEN, val_p0)))
-            if v + 1 < n_vecs:
-                par_ops.append(
-                    ("load", ("vload", val_base + (v + 1) * VLEN, val_p1))
-                )
-            seq_parallel(ptr_ops, par_ops)
+        # Tree-doubling pointer computation: avoid loading 32 offset constants
+        # Instead compute ptrs[v] = base + v*VLEN using doubling strides
+        # This replaces 32 const loads with ~5 const loads + ~32 ALU adds
+        
+        # Load stride constants for doubling
+        vlen_scratch = self.alloc_scratch("vlen_const")
+        zero_scratch = self.alloc_scratch("zero_const")
+        seq_parallel(ptr_ops, [
+            ("load", ("const", vlen_scratch, VLEN)),
+            ("load", ("const", zero_scratch, 0)),
+        ])
+        
+        # Initialize base pointers (v=0)
+        seq_parallel(ptr_ops, [
+            ("alu", ("+", idx_ptrs[0], self.scratch["inp_indices_p"], zero_scratch)),
+            ("alu", ("+", val_ptrs[0], self.scratch["inp_values_p"], zero_scratch)),
+        ])
+        
+        if n_vecs > 1:
+            # v=1: base + VLEN
+            seq_parallel(ptr_ops, [
+                ("alu", ("+", idx_ptrs[1], idx_ptrs[0], vlen_scratch)),
+                ("alu", ("+", val_ptrs[1], val_ptrs[0], vlen_scratch)),
+            ])
+        
+        # Doubling: for each power-of-2 stride, copy and add
+        stride = 2  # Start with stride of 2*VLEN
+        while stride < n_vecs:
+            stride_scratch = self.alloc_scratch(f"stride_{stride}")
+            seq_add(ptr_ops, "load", ("const", stride_scratch, stride * VLEN))
+            
+            # Compute ptrs[stride..2*stride-1] = ptrs[0..stride-1] + stride*VLEN
+            # Do in parallel batches of 12 ALU ops
+            batch = []
+            for v in range(stride, min(stride * 2, n_vecs)):
+                src = v - stride
+                batch.append(("alu", ("+", idx_ptrs[v], idx_ptrs[src], stride_scratch)))
+                batch.append(("alu", ("+", val_ptrs[v], val_ptrs[src], stride_scratch)))
+                if len(batch) >= 12:
+                    seq_parallel(ptr_ops, batch)
+                    batch = []
+            if batch:
+                seq_parallel(ptr_ops, batch)
+            stride *= 2
 
         pre_vec_ops.append(ptr_ops["ops"])
 
         self.schedule_ops(pre_vec_ops)
 
-        # Pause to align with reference_kernel2's initial yield.
         self.add("flow", ("pause",))
 
+        # CRITICAL OPTIMIZATION: Process operations in waves across all vectors
+        # Instead of vec0:[all ops], vec1:[all ops], ...
+        # Do: wave0:[op_type from all vecs], wave1:[next_op_type from all vecs], ...
+        # This maximizes VALU slot utilization (6 slots) by naturally grouping similar operations
+        
+        # We'll still use per-vector sequences but structure them for better interleaving
         vec_ops = [[] for _ in range(n_vecs)]
+        
+        period = forest_height + 1
+        
+        # Generate operations with careful grouping to help the scheduler
         for v in range(n_vecs):
             idx_vec = idx_base + v * VLEN
             val_vec = val_base + v * VLEN
@@ -699,9 +887,14 @@ class KernelBuilder:
                     ops.append((eng, sl, group))
                 group += 1
 
-            period = forest_height + 1
+            # Load initial values as first op (overlaps with other vecs' VALU)
+            add_op("load", ("vload", val_vec, val_ptrs[v]))
+
+            # Process all rounds for this vector
             for r in range(rounds):
                 depth = r % period
+                
+                # Node value fetch and XOR
                 if depth == 0:
                     add_op("valu", ("^", val_vec, val_vec, node_vecs[0]))
                 elif depth == 1:
@@ -711,6 +904,7 @@ class KernelBuilder:
                     )
                     add_op("valu", ("^", val_vec, val_vec, tmp2_vec))
                 elif depth == 2:
+                    # Depth 2: prefetched nodes with vselect
                     if r == rounds - 1:
                         add_parallel(
                             [
@@ -742,21 +936,21 @@ class KernelBuilder:
                     if r != rounds - 1:
                         add_op("load", ("vload", idx_vec, idx_ptrs[v]))
                 else:
+                    # Depth >= 3: dynamic memory loading (in-place gather)
                     base_vec = depth_base_vecs[depth]
                     add_op("valu", ("+", tmp1_vec, idx_vec, base_vec))
-                    for offset in range(0, VLEN, 2):
-                        par_ops = [
-                            ("load", ("load_offset", tmp2_vec, tmp1_vec, offset)),
-                        ]
-                        if offset + 1 < VLEN:
-                            par_ops.append(
-                                ("load", ("load_offset", tmp2_vec, tmp1_vec, offset + 1))
-                            )
-                        add_parallel(par_ops)
-                    add_op("valu", ("^", val_vec, val_vec, tmp2_vec))
+                    load_ops = []
+                    for offset in range(VLEN):
+                        load_ops.append(
+                            ("load", ("load_offset", tmp1_vec, tmp1_vec, offset))
+                        )
+                    add_parallel(load_ops)
+                    add_op("valu", ("^", val_vec, val_vec, tmp1_vec))
 
+                # Hash function: 6 stages, must be executed in order due to dependencies
                 for hi, (op1, _val1, op2, op3, _val3) in enumerate(HASH_STAGES):
                     if hash_mul[hi] is not None:
+                        # Fused instruction
                         add_op(
                             "valu",
                             (
@@ -767,37 +961,34 @@ class KernelBuilder:
                                 hash_const1[hi],
                             ),
                         )
-                        continue
-                    add_parallel(
-                        [
-                            ("valu", (op1, tmp1_vec, val_vec, hash_const1[hi])),
-                            ("valu", (op3, tmp2_vec, val_vec, hash_const3[hi])),
-                        ]
-                    )
-                    add_op("valu", (op2, val_vec, tmp1_vec, tmp2_vec))
-
+                    else:
+                        # Non-fused: keep parallelism, use val_vec for op3 to free tmp2
+                        add_parallel(
+                            [
+                                ("valu", (op1, tmp1_vec, val_vec, hash_const1[hi])),
+                                ("valu", (op3, val_vec, val_vec, hash_const3[hi])),
+                            ]
+                        )
+                        add_op("valu", (op2, val_vec, tmp1_vec, val_vec))
+                # Update index for next iteration
                 if r == rounds - 1:
+                    # Last round - skip index update
                     pass
                 elif depth == 0:
                     add_op("valu", ("&", idx_vec, val_vec, v_one))
                 elif depth != forest_height:
-                    if depth == 2:
-                        add_op("valu", ("&", tmp1_vec, val_vec, v_one))
-                        add_op(
-                            "valu",
-                            ("multiply_add", idx_vec, idx_vec, v_two, tmp1_vec),
-                        )
-                    else:
-                        add_op("valu", ("&", tmp1_vec, val_vec, v_one))
-                        add_op(
-                            "valu", ("multiply_add", idx_vec, idx_vec, v_two, tmp1_vec)
-                        )
+                    # idx = idx * 2 + (val & 1) using multiply_add
+                    add_op("valu", ("&", tmp1_vec, val_vec, v_one))
+                    add_op(
+                        "valu",
+                        ("multiply_add", idx_vec, idx_vec, v_two, tmp1_vec),
+                    )
 
+            # Store final result
             add_op("store", ("vstore", val_ptrs[v], val_vec))
 
         self.schedule_ops(vec_ops)
 
-        # Required to match with the yield in reference_kernel2
         self.instrs.append({"flow": [("pause",)]})
 
 BASELINE = 147734
