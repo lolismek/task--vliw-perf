@@ -241,7 +241,50 @@ def _do_schedule(slots, engines, rw, pred_sets, succs, priority, in_degree_orig,
                 if in_degree[s] == 0:
                     new_ready.append(s)
 
-        ready = not_packed + new_ready
+        # Second pass: pack newly ready ops into SAME cycle when safe
+        # Safe when dependency is WAR (write-after-read, zero latency)
+        # Unsafe when dependency is RAW (read-after-write in same cycle reads stale value)
+        packed_set = set(packed)
+        deferred = []
+        while new_ready:
+            extra_packed = []
+            extra_deferred = []
+            for idx in new_ready:
+                raw_conflict = False
+                for pred in pred_sets[idx]:
+                    if pred in packed_set:
+                        if rw[pred][1] & rw[idx][0]:
+                            raw_conflict = True
+                            break
+                if raw_conflict:
+                    extra_deferred.append(idx)
+                    continue
+                engine = engines[idx]
+                if used[engine] >= limits[engine]:
+                    extra_deferred.append(idx)
+                    continue
+                writes_i = rw[idx][1]
+                if writes_i & curr_writes:
+                    extra_deferred.append(idx)
+                    continue
+                instr.setdefault(engine, []).append(slots[idx][1])
+                used[engine] += 1
+                curr_writes |= writes_i
+                extra_packed.append(idx)
+                packed_set.add(idx)
+            if not extra_packed:
+                deferred.extend(extra_deferred)
+                break
+            cascade_ready = []
+            for idx in extra_packed:
+                for s in succs[idx]:
+                    in_degree[s] -= 1
+                    if in_degree[s] == 0:
+                        cascade_ready.append(s)
+            deferred.extend(extra_deferred)
+            new_ready = cascade_ready
+
+        ready = not_packed + deferred
         if seed == 0:
             ready.sort(key=lambda x: -priority[x])
         else:
@@ -331,7 +374,48 @@ def _do_backward_schedule(slots, engines, rw, pred_sets, succs, priority, limits
                 if out_degree[p] == 0:
                     new_ready.append(p)
 
-        ready = not_packed + new_ready
+        # Second pass: pack newly ready predecessors into same cycle when safe
+        packed_set = set(packed)
+        deferred = []
+        while new_ready:
+            extra_packed = []
+            extra_deferred = []
+            for idx in new_ready:
+                raw_conflict = False
+                for s in succs[idx]:
+                    if s in packed_set:
+                        if rw[idx][1] & rw[s][0]:
+                            raw_conflict = True
+                            break
+                if raw_conflict:
+                    extra_deferred.append(idx)
+                    continue
+                engine = engines[idx]
+                if used[engine] >= limits[engine]:
+                    extra_deferred.append(idx)
+                    continue
+                writes_i = rw[idx][1]
+                if writes_i & curr_writes:
+                    extra_deferred.append(idx)
+                    continue
+                instr.setdefault(engine, []).append(slots[idx][1])
+                used[engine] += 1
+                curr_writes |= writes_i
+                extra_packed.append(idx)
+                packed_set.add(idx)
+            if not extra_packed:
+                deferred.extend(extra_deferred)
+                break
+            cascade_ready = []
+            for idx in extra_packed:
+                for p in pred_sets[idx]:
+                    out_degree[p] -= 1
+                    if out_degree[p] == 0:
+                        cascade_ready.append(p)
+            deferred.extend(extra_deferred)
+            new_ready = cascade_ready
+
+        ready = not_packed + deferred
         if seed == 0:
             ready.sort(key=lambda x: -priority[x])
         else:
